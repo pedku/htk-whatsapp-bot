@@ -517,10 +517,8 @@ client.on("message", async (msg) => {
 
     // ─── CHAT ACTIVO? Pedro está conversando aquí ──
     if (esChatActivo(from)) {
-      // Notificar a Pedro que el contacto respondió
       const s = getSession(from);
       s.lastMsg = Date.now();
-      notify.notificarRespuestaSilenciada(from, s.nombre || "Desconocido", texto);
       console.log(`🟢 Chat activo (Pedro), ignorando: ${from}`);
       return;
     }
@@ -529,8 +527,7 @@ client.on("message", async (msg) => {
     if (estaSilenciado(from)) {
       const s = getSession(from);
       s.lastMsg = Date.now();
-      notify.notificarRespuestaSilenciada(from, s.nombre || "Desconocido", texto);
-      console.log(`🔇 Silenciado escribe: ${from}`);
+      console.log(`🔇 Silenciado escribe: ${from} → ignorado`);
       return;
     }
 
@@ -653,18 +650,28 @@ const apiServer = http.createServer((req, res) => {
       const chat = await client.getChatById(fullNumber);
       await chat.sendStateTyping();
       await new Promise(r => setTimeout(r, 1500));
-      await client.sendMessage(fullNumber, message);
+      const sentMsg = await client.sendMessage(fullNumber, message);
       
-      // 🔇 SILENCIAR número: el bot NO procesará NINGÚN mensaje de este contacto
-      // El silenciamiento es PERSISTENTE (silenced.json) — sobrevive reinicios
+      // Capturar el chat ID REAL (puede ser @lid si multi-device)
+      // El ID que WhatsApp devuelve en el mensaje enviado es el MISMO
+      // que usará cuando el lead responda.
+      const realChatId = sentMsg?.to || fullNumber;
+      
+      // 🔇 SILENCIAR en AMBOS formatos: el normalizado (@c.us) y el real (@lid si aplica)
       silenciarNumero(fullNumber);
+      if (realChatId !== fullNumber && realChatId !== to) {
+        silenciarNumero(realChatId);
+        console.log(`🔇 También silenciado ID real: ${realChatId}`);
+      }
+      // Marcar como chat activo (Pedro envió esto)
+      marcarChatActivo(realChatId);
       
-      // También marcar sesión en memoria (redundante, pero seguro)
-      const outboundSession = getSession(fullNumber);
+      // También marcar sesión en memoria
+      const outboundSession = getSession(realChatId);
       outboundSession.estado = ESTADOS.SILENT;
       outboundSession.lastMsg = Date.now();
       outboundSession.lead = outboundSession.lead || {
-        numero: fullNumber,
+        numero: realChatId,
         nombre: "Prospección outbound",
         canal: "WhatsApp",
         opcion: "Prospección",
@@ -673,7 +680,7 @@ const apiServer = http.createServer((req, res) => {
       outboundSession.leadFinalizado = true;
       outboundSession.atendidoPorPedro = true;
       
-      console.log(`✅ Mensaje enviado a ${fullNumber} 🔇 silenciado`);
+      console.log(`✅ Mensaje enviado a ${realChatId} 🔇 silenciado`);
       res.writeHead(200);
       res.end(JSON.stringify({ ok: true, to: fullNumber }));
     } catch (e) {
