@@ -497,49 +497,10 @@ client.on("message", async (msg) => {
 
     // ─── MENSAJES DEL PROPIETARIO (Pedro) ────────
     if (msg.fromMe || from === config.botNumber.replace(/^\+/, "") + "@c.us") {
-      let esComando = false;
+      // Los comandos se manejan desde el CRM (no desde WhatsApp)
+      // para evitar dejar rastro en chats de leads.
+      // Ver CRM → lead → botón "Silenciar"
       
-      // Comando global: /bot global off → apagar bot COMPLETAMENTE
-      if (/^\/bot\s+global\s+off/i.test(texto)) {
-        botGlobalOff = true;
-        esComando = true;
-        console.log(`🛑 BOT GLOBAL APAGADO por Pedro`);
-        // Enviar confirmación al propio chat (no al lead)
-        const selfChat = await client.getChatById(from);
-        await selfChat.sendStateTyping();
-        await new Promise(r => setTimeout(r, 1000));
-        await client.sendMessage(from, "🛑 Bot global APAGADO. Ya no proceso mensajes entrantes.\nPara encender: /bot global on");
-      }
-      // Comando global: /bot global on → encender bot
-      if (/^\/bot\s+global\s+on/i.test(texto)) {
-        botGlobalOff = false;
-        esComando = true;
-        console.log(`🟢 BOT GLOBAL ENCENDIDO por Pedro`);
-        const selfChat = await client.getChatById(from);
-        await selfChat.sendStateTyping();
-        await new Promise(r => setTimeout(r, 1000));
-        await client.sendMessage(from, "🟢 Bot global ENCENDIDO. Ya proceso mensajes entrantes.");
-      }
-      // Comando: /bot off → Pedro silencia permanentemente
-      if (/^\/bot\s+off/i.test(texto) && msg.to && !msg.to.includes("@g.us") && texto.toLowerCase().trim() !== "/bot global off") {
-        silenciarNumero(msg.to);
-        esComando = true;
-        console.log(`🔇 Pedro silenció: ${msg.to}`);
-      }
-      // Comando: /bot on → reactivar
-      if (/^\/bot\s+on/i.test(texto) && msg.to && !msg.to.includes("@g.us") && texto.toLowerCase().trim() !== "/bot global on") {
-        unsilenciarNumero(msg.to);
-        activeChats.delete(msg.to);
-        esComando = true;
-        console.log(`🔊 Pedro reactivó: ${msg.to}`);
-      }
-      
-      // Si fue un comando, borrar el mensaje del chat para que el lead NO lo vea
-      if (esComando) {
-        try { await msg.delete(true); } catch (e) { /* puede fallar, no importa */ }
-        return;
-      }
-
       // AUTO-SILENCE: cada msg de Pedro → marcar chat activo
       if (msg.to && !msg.to.includes("@g.us")) {
         marcarChatActivo(msg.to);
@@ -671,60 +632,80 @@ const apiServer = http.createServer((req, res) => {
     return res.end();
   }
   
-  if (req.method !== "POST" || req.url !== "/send") {
+  if (req.method !== "POST") {
     res.writeHead(404);
-    return res.end(JSON.stringify({ error: "Solo POST /send" }));
+    return res.end(JSON.stringify({ error: "Solo POST" }));
   }
 
   let body = "";
   req.on("data", chunk => body += chunk);
   req.on("end", async () => {
     try {
-      const { to, message } = JSON.parse(body);
-      if (!to || !message) {
-        res.writeHead(400);
-        return res.end(JSON.stringify({ error: "Faltan 'to' o 'message'" }));
+      const data = JSON.parse(body);
+      
+      if (req.url === "/send") {
+        const { to, message } = data;
+        if (!to || !message) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ error: "Faltan 'to' o 'message'" }));
+        }
+        const fullNumber = normalizarNumero(to);
+        const chat = await client.getChatById(fullNumber);
+        await chat.sendStateTyping();
+        await new Promise(r => setTimeout(r, 1500));
+        const sentMsg = await client.sendMessage(fullNumber, message);
+        const realChatId = sentMsg?.to || fullNumber;
+        silenciarNumero(fullNumber);
+        if (realChatId !== fullNumber && realChatId !== to) {
+          silenciarNumero(realChatId);
+          console.log(`🔇 También silenciado ID real: ${realChatId}`);
+        }
+        marcarChatActivo(realChatId);
+        const outboundSession = getSession(realChatId);
+        outboundSession.estado = ESTADOS.SILENT;
+        outboundSession.lastMsg = Date.now();
+        outboundSession.lead = outboundSession.lead || { numero: realChatId, nombre: "Prospección outbound", canal: "WhatsApp", opcion: "Prospección", detalle: "Mensaje de prospección enviado por API" };
+        outboundSession.leadFinalizado = true;
+        outboundSession.atendidoPorPedro = true;
+        console.log(`✅ Mensaje enviado a ${realChatId} 🔇 silenciado`);
+        res.writeHead(200);
+        return res.end(JSON.stringify({ ok: true, to: fullNumber }));
       }
       
-      const fullNumber = normalizarNumero(to);
-      const chat = await client.getChatById(fullNumber);
-      await chat.sendStateTyping();
-      await new Promise(r => setTimeout(r, 1500));
-      const sentMsg = await client.sendMessage(fullNumber, message);
-      
-      // Capturar el chat ID REAL (puede ser @lid si multi-device)
-      // El ID que WhatsApp devuelve en el mensaje enviado es el MISMO
-      // que usará cuando el lead responda.
-      const realChatId = sentMsg?.to || fullNumber;
-      
-      // 🔇 SILENCIAR en AMBOS formatos: el normalizado (@c.us) y el real (@lid si aplica)
-      silenciarNumero(fullNumber);
-      if (realChatId !== fullNumber && realChatId !== to) {
-        silenciarNumero(realChatId);
-        console.log(`🔇 También silenciado ID real: ${realChatId}`);
+      if (req.url === "/silence") {
+        const { numero } = data;
+        if (!numero) { res.writeHead(400); return res.end(JSON.stringify({ error: "Falta 'numero'" })); }
+        silenciarNumero(normalizarNumero(numero));
+        console.log(`🔇 Silenciado vía API: ${numero}`);
+        res.writeHead(200);
+        return res.end(JSON.stringify({ ok: true }));
       }
-      // Marcar como chat activo (Pedro envió esto)
-      marcarChatActivo(realChatId);
       
-      // También marcar sesión en memoria
-      const outboundSession = getSession(realChatId);
-      outboundSession.estado = ESTADOS.SILENT;
-      outboundSession.lastMsg = Date.now();
-      outboundSession.lead = outboundSession.lead || {
-        numero: realChatId,
-        nombre: "Prospección outbound",
-        canal: "WhatsApp",
-        opcion: "Prospección",
-        detalle: "Mensaje de prospección enviado por API",
-      };
-      outboundSession.leadFinalizado = true;
-      outboundSession.atendidoPorPedro = true;
+      if (req.url === "/unsilence") {
+        const { numero } = data;
+        if (!numero) { res.writeHead(400); return res.end(JSON.stringify({ error: "Falta 'numero'" })); }
+        unsilenciarNumero(normalizarNumero(numero));
+        res.writeHead(200);
+        return res.end(JSON.stringify({ ok: true }));
+      }
       
-      console.log(`✅ Mensaje enviado a ${realChatId} 🔇 silenciado`);
-      res.writeHead(200);
-      res.end(JSON.stringify({ ok: true, to: fullNumber }));
+      if (req.url === "/global-off") {
+        botGlobalOff = true;
+        console.log(`🛑 Bot global APAGADO vía API`);
+        res.writeHead(200);
+        return res.end(JSON.stringify({ ok: true, status: "off" }));
+      }
+      
+      if (req.url === "/global-on") {
+        botGlobalOff = false;
+        console.log(`🟢 Bot global ENCENDIDO vía API`);
+        res.writeHead(200);
+        return res.end(JSON.stringify({ ok: true, status: "on" }));
+      }
+      
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: "Ruta no encontrada" }));
     } catch (e) {
-      console.error(`❌ Error enviando mensaje:`, e.message);
       res.writeHead(500);
       res.end(JSON.stringify({ error: e.message }));
     }
