@@ -73,7 +73,7 @@ function guardarSilenced() {
 }
 
 function silenciarNumero(numero, ttlMs = null, reason = "manual") {
-  const normalizado = numero.includes("@c.us") ? numero : `${numero.replace(/[^0-9]/g, "")}@c.us`;
+  const normalizado = normalizarNumero(numero);
   const untilTs = ttlMs ? Date.now() + ttlMs : null;
   silencedMap.set(normalizado, { untilTs, reason });
   guardarSilenced();
@@ -81,9 +81,21 @@ function silenciarNumero(numero, ttlMs = null, reason = "manual") {
 }
 
 function estaSilenciado(numero) {
-  const normalizado = numero.includes("@c.us") ? numero : numero;
+  const normalizado = normalizarNumero(numero);
   const entry = silencedMap.get(normalizado);
-  if (!entry) return false;
+  if (!entry) {
+    // También buscar sin código de país (ej: 3208130156 → 573208130156)
+    const alternativo = alternarCodigoPais(normalizado);
+    if (alternativo) {
+      const altEntry = silencedMap.get(alternativo);
+      if (!altEntry) return false;
+      // Remapear para futuros lookups
+      silencedMap.set(normalizado, { ...altEntry });
+      guardarSilenced();
+      return !(altEntry.untilTs && Date.now() > altEntry.untilTs);
+    }
+    return false;
+  }
   // Expirar automáticamente si tiene TTL y ya pasó
   if (entry.untilTs && Date.now() > entry.untilTs) {
     silencedMap.delete(normalizado);
@@ -93,9 +105,37 @@ function estaSilenciado(numero) {
   return true;
 }
 
+function normalizarNumero(numero) {
+  // Asegurar formato estándar: código_país + número + @c.us
+  let n = numero.includes("@c.us") ? numero : `${numero}@c.us`;
+  // Quitar el + si existe
+  n = n.replace(/^\+/, "");
+  return n;
+}
+
+function alternarCodigoPais(numero) {
+  // Si tiene código de país 57 (Colombia), devolver versión sin él
+  // Si NO tiene código de país, devolver versión con 57
+  const limpio = numero.replace("@c.us", "");
+  if (limpio.startsWith("57") && limpio.length === 12) {
+    return limpio.substring(2) + "@c.us";
+  }
+  if (limpio.length === 10) {
+    return "57" + limpio + "@c.us";
+  }
+  return null;
+}
+
 function unsilenciarNumero(numero) {
-  const normalizado = numero.includes("@c.us") ? numero : numero;
+  const normalizado = normalizarNumero(numero);
   const existed = silencedMap.has(normalizado);
+  // También intentar versión alternativa
+  const alternativo = alternarCodigoPais(normalizado);
+  if (!existed && alternativo && silencedMap.has(alternativo)) {
+    silencedMap.delete(alternativo);
+    guardarSilenced();
+    return true;
+  }
   silencedMap.delete(normalizado);
   if (existed) guardarSilenced();
   return existed;
@@ -134,14 +174,27 @@ const COOLDOWN_MS = 5 * 60 * 1000;            // 5 minutos
 const cooldownMap = new Map();                 // num → timestamp de fin
 
 function setCooldown(numero) {
-  const normalizado = numero.includes("@c.us") ? numero : `${numero.replace(/[^0-9]/g, "")}@c.us`;
+  const normalizado = normalizarNumero(numero);
   cooldownMap.set(normalizado, Date.now() + COOLDOWN_MS);
 }
 
 function enCooldown(numero) {
-  const normalizado = numero.includes("@c.us") ? numero : numero;
+  const normalizado = normalizarNumero(numero);
   const until = cooldownMap.get(normalizado);
-  if (!until) return false;
+  if (!until) {
+    // Intentar formato alternativo
+    const alternativo = alternarCodigoPais(normalizado);
+    if (alternativo) {
+      const altUntil = cooldownMap.get(alternativo);
+      if (!altUntil) return false;
+      if (Date.now() > altUntil) {
+        cooldownMap.delete(alternativo);
+        return false;
+      }
+      return true;
+    }
+    return false;
+  }
   if (Date.now() > until) {
     cooldownMap.delete(normalizado);
     return false;
@@ -444,37 +497,88 @@ client.on("ready", () => {
 
 client.on("authenticated", () => console.log("🔐 Sesión autenticada."));
 
+// ─── RESOLVER NÚMERO REAL (lid → c.us) ──────────
+// WhatsApp multi-device usa IDs internos (@lid) en vez de números (@c.us).
+// Esta función resuelve el número real para que silenced/cooldown funcionen.
+const resolvedNumbers = new Map(); // cache: lid → c.us
+
+function esFormatoEstandar(id) {
+  return id && (id.includes("@c.us") || id.includes("@g.us"));
+}
+
+async function resolverNumeroReal(msg) {
+  const from = typeof msg === "string" ? msg : msg.from;
+  // Si ya es formato estándar, devolver tal cual
+  if (esFormatoEstandar(from)) return from;
+  
+  // Si ya tenemos cacheado, usar cache
+  if (resolvedNumbers.has(from)) return resolvedNumbers.get(from);
+  
+  // Si es un string (no message object), no podemos resolver más
+  if (typeof msg === "string") return from;
+  
+  // Intentar resolver vía getContact
+  try {
+    const contact = await msg.getContact();
+    const number = contact.number || contact.id?.user;
+    if (number) {
+      const resolved = `${number}@c.us`;
+      resolvedNumbers.set(from, resolved);
+      console.log(`🔍 Resuelto ${from} → ${resolved}`);
+      return resolved;
+    }
+  } catch (e) {
+    // Fallback: intentar getChat
+    try {
+      const chat = await msg.getChat();
+      const chatId = chat.id?._serialized || chat.id?.user;
+      if (chatId && esFormatoEstandar(chatId)) {
+        resolvedNumbers.set(from, chatId);
+        console.log(`🔍 Resuelto (vía chat) ${from} → ${chatId}`);
+        return chatId;
+      }
+    } catch (e2) {
+      console.log(`⚠️ No se pudo resolver ${from}: ${e2.message}`);
+    }
+  }
+  
+  // No se pudo resolver — devolver el ID original
+  return from;
+}
+
 // ─── MANEJADOR DE MENSAJES ──────────────────────────
 client.on("message", async (msg) => {
   try {
-    const from = msg.from;
+    const fromRaw = msg.from;
     const texto = msg.body.trim();
     
     // ─── IGNORAR GRUPOS ──────────────────────────
-    if (from.includes("@g.us")) return;
+    if (fromRaw.includes("@g.us")) return;
 
+    // ─── RESOLVER NÚMERO REAL ────────────────────
+    // Si es mensaje propio, usar fromRaw directamente
+    const from = msg.fromMe ? fromRaw : await resolverNumeroReal(msg);
+    
     // ─── MENSAJES DEL PROPIETARIO (Pedro) ────────
     const botNumberClean = config.botNumber.replace(/^\+/, "") + "@c.us";
     if (msg.fromMe || from === botNumberClean) {
       // Comando: /bot off → Pedro silencia el contacto permanentemente
-      if (/^\/bot\s+off/i.test(texto) && msg.to && msg.to !== from && !msg.to.includes("@g.us")) {
-        const target = msg.to.includes("@c.us") ? msg.to : `${msg.to}@c.us`;
+      if (/^\/bot\s+off/i.test(texto) && msg.to && msg.to !== fromRaw && !msg.to.includes("@g.us")) {
+        const target = normalizarNumero(msg.to);
         silenciarNumero(target, null, "pedro_comando");
         console.log(`🔇 Pedro silenció manualmente: ${target}`);
       }
       // Comando: /bot on → Pedro reactiva el bot para ese contacto
-      if (/^\/bot\s+on/i.test(texto) && msg.to && msg.to !== from && !msg.to.includes("@g.us")) {
-        const target = msg.to.includes("@c.us") ? msg.to : `${msg.to}@c.us`;
+      if (/^\/bot\s+on/i.test(texto) && msg.to && msg.to !== fromRaw && !msg.to.includes("@g.us")) {
+        const target = normalizarNumero(msg.to);
         unsilenciarNumero(target);
         cooldownMap.delete(target);
         console.log(`🔊 Pedro reactivó bot para: ${target}`);
       }
 
-      // AUTO-SILENCE + COOLDOWN: Cada vez que Pedro escribe a un contacto
-      // manualmente, el bot se silencia por 2h + espera 5min antes de procesar.
-      // Así si el lead responde inmediatamente, el bot no interfiere.
-      if (msg.to && msg.to !== from && !msg.to.includes("@g.us")) {
-        const target = msg.to.includes("@c.us") ? msg.to : `${msg.to}@c.us`;
+      // AUTO-SILENCE + COOLDOWN
+      if (msg.to && msg.to !== fromRaw && !msg.to.includes("@g.us")) {
+        const target = normalizarNumero(msg.to);
         silenciarNumero(target, AUTOSILENCE_TTL, "pedro_activo");
         setCooldown(target);
         console.log(`🔇 Auto-silence ${Math.round(AUTOSILENCE_TTL / 3600000)}h + cooldown ${Math.round(COOLDOWN_MS / 60000)}min → ${target}`);
@@ -487,7 +591,7 @@ client.on("message", async (msg) => {
       const s = getSession(from);
       s.lastMsg = Date.now();
       notify.notificarRespuestaSilenciada(from, s.nombre || "Desconocido", texto);
-      console.log(`🔇 Silenciado escribió: ${from} (razón: notificado a Pedro)`);
+      console.log(`🔇 Silenciado escribió: ${from} → notificado a Pedro, bot NO responde`);
       return;
     }
 
@@ -498,6 +602,8 @@ client.on("message", async (msg) => {
       console.log(`⏳ Cooldown activo para ${from}, ignorando mensaje`);
       return;
     }
+
+    console.log(`📩 Mensaje de ${from}: "${texto.substring(0, 80)}"`);
 
     const session = getSession(from);
     session.numero = from;
@@ -612,7 +718,7 @@ const apiServer = http.createServer((req, res) => {
         return res.end(JSON.stringify({ error: "Faltan 'to' o 'message'" }));
       }
       
-      const fullNumber = to.includes("@c.us") ? to : `${to.replace(/[^0-9]/g, "")}@c.us`;
+      const fullNumber = normalizarNumero(to);
       const chat = await client.getChatById(fullNumber);
       await chat.sendStateTyping();
       await new Promise(r => setTimeout(r, 1500));
