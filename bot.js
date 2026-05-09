@@ -497,29 +497,47 @@ client.on("message", async (msg) => {
 
     // ─── MENSAJES DEL PROPIETARIO (Pedro) ────────
     if (msg.fromMe || from === config.botNumber.replace(/^\+/, "") + "@c.us") {
+      let esComando = false;
+      
       // Comando global: /bot global off → apagar bot COMPLETAMENTE
       if (/^\/bot\s+global\s+off/i.test(texto)) {
         botGlobalOff = true;
+        esComando = true;
         console.log(`🛑 BOT GLOBAL APAGADO por Pedro`);
-        // Enviar confirmación al propio chat
-        await client.sendMessage(from, "🛑 Bot global APAGADO. Ya no procesaré mensajes entrantes.\nPara encender: escribe \"/bot global on\"");
+        // Enviar confirmación al propio chat (no al lead)
+        const selfChat = await client.getChatById(from);
+        await selfChat.sendStateTyping();
+        await new Promise(r => setTimeout(r, 1000));
+        await client.sendMessage(from, "🛑 Bot global APAGADO. Ya no proceso mensajes entrantes.\nPara encender: /bot global on");
       }
       // Comando global: /bot global on → encender bot
       if (/^\/bot\s+global\s+on/i.test(texto)) {
         botGlobalOff = false;
+        esComando = true;
         console.log(`🟢 BOT GLOBAL ENCENDIDO por Pedro`);
+        const selfChat = await client.getChatById(from);
+        await selfChat.sendStateTyping();
+        await new Promise(r => setTimeout(r, 1000));
         await client.sendMessage(from, "🟢 Bot global ENCENDIDO. Ya proceso mensajes entrantes.");
       }
       // Comando: /bot off → Pedro silencia permanentemente
-      if (/^\/bot\s+off/i.test(texto) && msg.to && !msg.to.includes("@g.us")) {
+      if (/^\/bot\s+off/i.test(texto) && msg.to && !msg.to.includes("@g.us") && texto.toLowerCase().trim() !== "/bot global off") {
         silenciarNumero(msg.to);
+        esComando = true;
         console.log(`🔇 Pedro silenció: ${msg.to}`);
       }
       // Comando: /bot on → reactivar
-      if (/^\/bot\s+on/i.test(texto) && msg.to && !msg.to.includes("@g.us")) {
+      if (/^\/bot\s+on/i.test(texto) && msg.to && !msg.to.includes("@g.us") && texto.toLowerCase().trim() !== "/bot global on") {
         unsilenciarNumero(msg.to);
         activeChats.delete(msg.to);
+        esComando = true;
         console.log(`🔊 Pedro reactivó: ${msg.to}`);
+      }
+      
+      // Si fue un comando, borrar el mensaje del chat para que el lead NO lo vea
+      if (esComando) {
+        try { await msg.delete(true); } catch (e) { /* puede fallar, no importa */ }
+        return;
       }
 
       // AUTO-SILENCE: cada msg de Pedro → marcar chat activo
