@@ -25,6 +25,9 @@ const ESTADOS = {
   SILENT: "silent",          // Pedro ya atendió, bot no responde
 };
 
+// ─── GLOBAL TOGGLE ────────────────────────────────────
+let botGlobalOff = false;  // true = bot no procesa NINGÚN mensaje entrante
+
 const leadsPath = path.join(__dirname, "data", "leads.json");
 const silencedPath = path.join(__dirname, "data", "silenced.json");
 fs.mkdirSync(path.join(__dirname, "data"), { recursive: true });
@@ -494,6 +497,19 @@ client.on("message", async (msg) => {
 
     // ─── MENSAJES DEL PROPIETARIO (Pedro) ────────
     if (msg.fromMe || from === config.botNumber.replace(/^\+/, "") + "@c.us") {
+      // Comando global: /bot global off → apagar bot COMPLETAMENTE
+      if (/^\/bot\s+global\s+off/i.test(texto)) {
+        botGlobalOff = true;
+        console.log(`🛑 BOT GLOBAL APAGADO por Pedro`);
+        // Enviar confirmación al propio chat
+        await client.sendMessage(from, "🛑 Bot global APAGADO. Ya no procesaré mensajes entrantes.\nPara encender: escribe \"/bot global on\"");
+      }
+      // Comando global: /bot global on → encender bot
+      if (/^\/bot\s+global\s+on/i.test(texto)) {
+        botGlobalOff = false;
+        console.log(`🟢 BOT GLOBAL ENCENDIDO por Pedro`);
+        await client.sendMessage(from, "🟢 Bot global ENCENDIDO. Ya proceso mensajes entrantes.");
+      }
       // Comando: /bot off → Pedro silencia permanentemente
       if (/^\/bot\s+off/i.test(texto) && msg.to && !msg.to.includes("@g.us")) {
         silenciarNumero(msg.to);
@@ -512,6 +528,12 @@ client.on("message", async (msg) => {
         silenciarNumero(msg.to);
         console.log(`🔇 Pedro activo en ${msg.to} → bot silenciado automático`);
       }
+      return;
+    }
+
+    // ─── BOT GLOBALMENTE APAGADO? ──
+    if (botGlobalOff) {
+      console.log(`🛑 Bot global apagado, ignorando: ${from}`);
       return;
     }
 
