@@ -16,6 +16,7 @@ const msgs = require("./messages");
 const faq = require("./faq");
 // DEPRECATED: const sheets = require("./sheets"); — Ahora todo en CRM
 const notify = require("./notify");
+const lidResolver = require("./lid-resolver");
 
 // ─── CONSTANTES ──────────────────────────────────────
 const ESTADOS = {
@@ -269,6 +270,9 @@ setInterval(() => {
     console.log(`🧹 Silencios expirados limpiados (${silencedMap.size} restantes)`);
   }
 }, 60000);  // cada minuto
+
+// ─── INICIALIZAR LID RESOLVER ────────────────────────
+lidResolver.init();
 
 // ─── FUNCIONES BASE ───────────────────────────────────
 function personalizar(texto, nombre) {
@@ -659,6 +663,35 @@ client.on("message", async (msg) => {
       return;
     }
 
+    // ─── RESOLVER @LID → @C.US ─────────────────────
+    let resolvedFrom = from;
+    if (from.includes("@lid") || from.includes("@s.whatsapp.net")) {
+      const resolved = await lidResolver.resolve(from, msg, client, client.pupPage);
+      if (resolved && resolved.phone) {
+        resolvedFrom = resolved.phone;
+        console.log(`🔗 LID ${from} resuelto → ${resolvedFrom} (${resolved.source}, confianza: ${resolved.confidence})`);
+        
+        // Re-verificar silencio con el número real
+        if (estaSilenciado(resolvedFrom)) {
+          const s = getSession(from);
+          s.lastMsg = Date.now();
+          console.log(`🔇 Silenciado (resuelto) escribe: ${resolvedFrom} → ignorado`);
+          return;
+        }
+        
+        // Migrar sesión si existe
+        const fromSession = sessions.get(from);
+        const resolvedSession = sessions.get(resolvedFrom);
+        if (fromSession && !resolvedSession) {
+          sessions.set(resolvedFrom, fromSession);
+          sessions.delete(from);
+        }
+      } else {
+        console.log(`⚠️ LID ${from} no pudo resolverse — procesando como @lid`);
+      }
+    }
+    from = resolvedFrom;
+
     console.log(`📩 Mensaje de ${from}: "${texto.substring(0, 80)}"`);
 
     const session = getSession(from);
@@ -809,6 +842,17 @@ const apiServer = http.createServer((req, res) => {
           return res.end(JSON.stringify({ ok: false, error: errMsg.substring(0,200), to: fullNumber }));
         }
         const realChatId = sentMsg?.to || fullNumber;
+        
+        // Registrar mensaje outbound para resolución @lid
+        const sentId = sentMsg?.id?._serialized || sentMsg?.id?.id || "";
+        if (sentId) {
+          lidResolver.recordOutbound(sentId, fullNumber, data.lead_id || null, message);
+          // Si el ID real difiere del original (p.ej. @lid), registrar ambos
+          if (realChatId !== fullNumber) {
+            lidResolver.recordOutbound(sentId + "_real", realChatId, data.lead_id || null, message);
+          }
+        }
+        
         silenciarNumero(fullNumber);
         if (realChatId !== fullNumber && realChatId !== to) {
           silenciarNumero(realChatId);
