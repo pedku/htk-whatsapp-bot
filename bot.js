@@ -1,7 +1,11 @@
-// bot.js — WhatsApp Bot HTK INGENIERIA v2
+// bot.js — WhatsApp Bot HTK INGENIERIA v3
 // Máquina de estados: IDLE → MENU → AWAITING_DETAILS → LEAD_COMPLETE
 // Sin LLM. Respuestas predefinidas instantáneas.
 // Un lead por sesión, enriquecido progresivamente.
+//
+// v4: Message ID dedup, filtro status/newsletter, persistencia global-off,
+//     silencing con expiración (7d pitch / 30min lead), despedida con reset,
+//     logging post-respuesta, manejo graceful de puerto API
 
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const qrcode = require("qrcode-terminal");
@@ -25,8 +29,42 @@ const ESTADOS = {
   SILENT: "silent",          // Pedro ya atendió, bot no responde
 };
 
-// ─── GLOBAL TOGGLE ────────────────────────────────────
-let botGlobalOff = false;  // true = bot no procesa NINGÚN mensaje entrante
+// ─── GLOBAL TOGGLE (persistente) ─────────────────────
+const globalOffPath = path.join(__dirname, "data", "global_off.json");
+let botGlobalOff = false;
+try {
+  if (fs.existsSync(globalOffPath)) {
+    botGlobalOff = JSON.parse(fs.readFileSync(globalOffPath, "utf-8")).off === true;
+    if (botGlobalOff) console.log("🛑 Bot global APAGADO (persistido)");
+  }
+} catch (e) { /* ignorar */ }
+function guardarGlobalOff() {
+  try { fs.writeFileSync(globalOffPath, JSON.stringify({ off: botGlobalOff, ts: Date.now() }), "utf-8"); }
+  catch (e) { console.error("Error guardando global_off:", e.message); }
+}
+
+// ─── MESSAGE ID DEDUP ────────────────────────────────
+// Evita procesar el mismo mensaje dos veces si whatsapp-web.js
+// dispara el evento message repetido (reconnect, race conditions).
+const processedIds = new Set();
+const DEDUP_MAX = 2000;  // mantener últimas 2000 IDs
+function marcarProcesado(msgId) {
+  if (!msgId) return;
+  processedIds.add(msgId);
+  if (processedIds.size > DEDUP_MAX) {
+    // Limpiar el 50% más antiguo (aproximado: solo mantener los últimos DEDUP_MAX/2)
+    const iter = processedIds.values();
+    const toDelete = DEDUP_MAX / 2;
+    for (let i = 0; i < toDelete; i++) {
+      const next = iter.next();
+      if (next.done) break;
+      processedIds.delete(next.value);
+    }
+  }
+}
+function yaProcesado(msgId) {
+  return msgId && processedIds.has(msgId);
+}
 
 const leadsPath = path.join(__dirname, "data", "leads.json");
 const silencedPath = path.join(__dirname, "data", "silenced.json");
@@ -89,10 +127,13 @@ setInterval(() => {
   }
 }, 60000);  // cada minuto
 
-// ─── SILENCED v4 — simplificado, solo para API sends ──
-// El silencedMap ahora guarda números EN AMBOS FORMATOS
-// (@c.us y @lid) para cubrir cualquier escenario.
+// ─── SILENCED v5 — con expiración ─────────────────
+// El silencio tiene una duración configurable.
+// Por defecto: 7 días para pitches, 30 min para activeChats.
+// El silencedMap guarda: número → { untilTs }
 // Persiste en disco para sobrevivir reinicios.
+const SILENCE_TTL_PITCH = 2 * 24 * 60 * 60 * 1000;   // 2 días para prospección
+const SILENCE_TTL_LEAD = 30 * 60 * 1000;               // 30 min para leads derivados
 let silencedMap = new Map();
 
 function normalizarNumero(numero) {
@@ -104,25 +145,49 @@ function normalizarNumero(numero) {
   return n;
 }
 
-function silenciarNumero(numero) {
+function silenciarNumero(numero, ttlMs) {
   if (!numero || typeof numero !== "string") return;
+  ttlMs = ttlMs || SILENCE_TTL_PITCH;  // default 7 días
+  const untilTs = Date.now() + ttlMs;
   const normalizado = normalizarNumero(numero);
-  silencedMap.set(normalizado, Date.now());
+  silencedMap.set(normalizado, untilTs);
   // Guardar también raw (por si llega como @lid)
   if (numero !== normalizado && numero.length > 5) {
-    silencedMap.set(numero, Date.now());
+    silencedMap.set(numero, untilTs);
   }
   guardarSilenced();
 }
 
+function silenciarNumeroTemporal(numero, ttlMs) {
+  // Igual que silenciarNumero pero con TTL explícito
+  silenciarNumero(numero, ttlMs);
+}
+
 function estaSilenciado(numero) {
   if (!numero) return false;
-  // Buscar primero tal cual
-  if (silencedMap.has(numero)) return true;
-  // Buscar normalizado
-  const norm = normalizarNumero(numero);
-  if (norm && silencedMap.has(norm)) return true;
-  return false;
+  const ahora = Date.now();
+  let expirados = [];
+  
+  // Función helper: revisar una clave y limpiar si expiró
+  function revisar(clave) {
+    if (!silencedMap.has(clave)) return false;
+    const untilTs = silencedMap.get(clave);
+    if (typeof untilTs === 'number' && ahora > untilTs) {
+      expirados.push(clave);
+      return false;  // expiró, no está silenciado
+    }
+    return true;
+  }
+  
+  const encontrado = revisar(numero) || revisar(normalizarNumero(numero));
+  
+  // Limpiar expirados de una vez
+  for (const e of expirados) {
+    silencedMap.delete(e);
+  }
+  if (expirados.length > 0) guardarSilenced();
+  
+  return encontrado;
 }
 
 function unsilenciarNumero(numero) {
@@ -130,18 +195,22 @@ function unsilenciarNumero(numero) {
   const deleted = silencedMap.delete(numero);
   const deleted2 = silencedMap.delete(normalizarNumero(numero));
   if (deleted || deleted2) guardarSilenced();
+  // También limpiar activeChats para este número
+  activeChats.delete(numero);
+  activeChats.delete(normalizarNumero(numero));
   return deleted || deleted2;
 }
 
 function guardarSilenced() {
   try {
-    const data = [];
+    const data = {};
     const validKeys = ["@c.us", "@lid", "@s.whatsapp.net"];
-    for (const key of silencedMap.keys()) {
-      // Solo guardar si tiene formato de número válido
-      if (key && key.length > 5 && validKeys.some(s => key.includes(s))) {
-        data.push(key);
-      }
+    const ahora = Date.now();
+    for (const [key, untilTs] of silencedMap) {
+      if (!key || key.length <= 5) continue;
+      if (!validKeys.some(s => key.includes(s))) continue;
+      if (typeof untilTs === 'number' && ahora > untilTs) continue;  // expirado, no guardar
+      data[key] = typeof untilTs === 'number' ? untilTs : Date.now() + SILENCE_TTL_PITCH;
     }
     fs.writeFileSync(silencedPath, JSON.stringify(data, null, 2), "utf-8");
   } catch (e) { console.error("Error guardando silenced.json:", e.message); }
@@ -151,23 +220,55 @@ function guardarSilenced() {
 (function cargarSilenced() {
   try {
     if (fs.existsSync(silencedPath)) {
-      const saved = JSON.parse(fs.readFileSync(silencedPath, "utf-8"));
+      const raw = fs.readFileSync(silencedPath, "utf-8");
+      const saved = JSON.parse(raw);
+      const ahora = Date.now();
+      let count = 0;
+      
       if (Array.isArray(saved)) {
+        // Formato antiguo (solo números sin expiry) → migrar con TTL default
         for (const item of saved) {
-          if (typeof item === "string") {
-            silencedMap.set(item, Date.now());
+          if (typeof item === "string" && item.length > 5) {
+            silencedMap.set(item, ahora + SILENCE_TTL_LEAD);  // legacy: 30 min
+            count++;
           } else if (item && item.num) {
-            // Formato antiguo con { num, untilTs, reason }
-            silencedMap.set(item.num, Date.now());
+            silencedMap.set(item.num, ahora + SILENCE_TTL_LEAD);
+            count++;
           }
         }
+      } else if (typeof saved === 'object' && saved !== null) {
+        // Formato nuevo: { "numero@lid": untilTs, ... }
+        for (const [key, untilTs] of Object.entries(saved)) {
+          if (!key || key.length <= 5) continue;
+          const ts = typeof untilTs === 'number' ? untilTs : ahora + SILENCE_TTL_PITCH;
+          if (ahora > ts) continue;  // ya expiró, no cargar
+          silencedMap.set(key, ts);
+          count++;
+        }
       }
-      console.log(`🔇 ${silencedMap.size} números silenciados cargados`);
+      
+      console.log(`🔇 ${count} números silenciados cargados`);
     }
   } catch (e) {
     console.log("🔇 Sin silenced.json previo");
   }
 })();
+
+// Limpieza periódica de silencios expirados
+setInterval(() => {
+  const ahora = Date.now();
+  let cambios = false;
+  for (const [key, untilTs] of silencedMap) {
+    if (typeof untilTs === 'number' && ahora > untilTs) {
+      silencedMap.delete(key);
+      cambios = true;
+    }
+  }
+  if (cambios) {
+    guardarSilenced();
+    console.log(`🧹 Silencios expirados limpiados (${silencedMap.size} restantes)`);
+  }
+}, 60000);  // cada minuto
 
 // ─── FUNCIONES BASE ───────────────────────────────────
 function personalizar(texto, nombre) {
@@ -430,8 +531,18 @@ function responder(session, estado, opcion, texto, nombre) {
     // ─── SILENT: Pedro atendió, bot no responde ──
     case ESTADOS.SILENT:
     case ESTADOS.CLOSED: {
+      // Si el número fue desilenciado manualmente, resetear a IDLE
+      if (!estaSilenciado(session.numero)) {
+        console.log(`🔄 Reset a IDLE desde SILENT (desilenciado): ${session.numero}`);
+        session.estado = ESTADOS.IDLE;
+        session.lead = null;
+        session.leadFinalizado = false;
+        session.nombre = "";
+        session.notificado = false;
+        // Reprocesar con estado IDLE
+        return responder(session, ESTADOS.IDLE, opcion, texto, nombre || "👤");
+      }
       // Modo silencioso — bot no interfiere en la conversación
-      // El cliente quedó en manos de Pedro
       return null;
     }
 
@@ -491,9 +602,25 @@ client.on("message", async (msg) => {
   try {
     const from = msg.from;
     const texto = msg.body.trim();
+
+    // ─── LOG RAW (DEBUG) ────────────────────────
+    console.log(`📩 RAW: from=${from} body="${(msg.body||'').substring(0,80)}" type=${msg.type} fromMe=${msg.fromMe} hasMedia=${!!msg.hasMedia} id=${msg.id?.id?.substring(0,12) || '?'}`);
     
-    // ─── IGNORAR GRUPOS ──────────────────────────
-    if (from.includes("@g.us")) return;
+    // ─── IGNORAR NO-INDIVIDUOS ──────────────────
+    // Grupos, estados (stories), newsletters
+    if (from.includes("@g.us") || from === "status@broadcast" || from.includes("@newsletter")) return;
+
+    // ─── IGNORAR VACÍOS ─────────────────────────
+    // WhatsApp status updates llegan como mensajes vacíos
+    if (!texto && !msg.caption) return;
+
+    // ─── DEDUP: mismo mensaje ya procesado? ──────
+    const msgId = msg.id?.id || msg.id?._serialized || "";
+    if (yaProcesado(msgId)) {
+      console.log(`⏭️  Dup skip: ${from} msg=${msgId.substring(0,12)}`);
+      return;
+    }
+    marcarProcesado(msgId);
 
     // ─── MENSAJES DEL PROPIETARIO (Pedro) ────────
     if (msg.fromMe || from === config.botNumber.replace(/^\+/, "") + "@c.us") {
@@ -512,7 +639,7 @@ client.on("message", async (msg) => {
 
     // ─── BOT GLOBALMENTE APAGADO? ──
     if (botGlobalOff) {
-      console.log(`🛑 Bot global apagado, ignorando: ${from}`);
+      // No loguear cada mensaje, solo el primero cada 10s
       return;
     }
 
@@ -593,8 +720,14 @@ client.on("message", async (msg) => {
 
     // DESPEDIDA desde cualquier estado
     if (opcion === "despedida") {
-      await msg.reply(personalizar(msgs.despedida, nombre));
-      session.estado = ESTADOS.SILENT;
+      const despedidaTexto = personalizar(msgs.despedida, nombre) + "\n\nSi necesitas algo más, solo escribe *Hola* y estaré aquí para ayudarte. 🙌";
+      await msg.reply(despedidaTexto);
+      // No silenciar, reiniciar para que pueda volver a escribir "Hola"
+      session.estado = ESTADOS.IDLE;
+      session.lead = null;
+      session.leadFinalizado = false;
+      session.autoCount = 0;
+      session.nombre = "";
       return;
     }
 
@@ -607,11 +740,18 @@ client.on("message", async (msg) => {
     // ─── PROCESAR SEGÚN ESTADO ─────────────────
     const respuesta = responder(session, session.estado, opcion, texto, nombre);
     if (respuesta) {
-      await msg.reply(respuesta);
+      try {
+        await msg.reply(respuesta);
+        console.log(`✅ Respondido a ${from}: ${respuesta.substring(0, 60)}...`);
+      } catch (replyErr) {
+        console.error(`❌ Error al responder a ${from}:`, replyErr.message);
+      }
+    } else {
+      console.log(`⚠️ Sin respuesta para ${from} (opcion=${opcion}, estado=${session.estado})`);
     }
 
   } catch (error) {
-    console.error("❌ Error:", error.message);
+    console.error("❌ Error:", error.message, error.stack?.substring(0, 200));
   }
 });
 
@@ -650,10 +790,24 @@ const apiServer = http.createServer((req, res) => {
           return res.end(JSON.stringify({ error: "Faltan 'to' o 'message'" }));
         }
         const fullNumber = normalizarNumero(to);
-        const chat = await client.getChatById(fullNumber);
-        await chat.sendStateTyping();
-        await new Promise(r => setTimeout(r, 1500));
-        const sentMsg = await client.sendMessage(fullNumber, message);
+        let sentMsg;
+        try {
+          // Intentar typing first (puede fallar si no hay LID)
+          const chat = await client.getChatById(fullNumber);
+          await chat.sendStateTyping().catch(() => {});
+        } catch (e) {
+          // No LID — enviar directo igual
+          console.log(`⚠️ Sin chat previo con ${fullNumber}, enviando directo...`);
+        }
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+          sentMsg = await client.sendMessage(fullNumber, message);
+        } catch (sendErr) {
+          const errMsg = sendErr.message || String(sendErr);
+          console.log(`❌ Error enviando a ${fullNumber}: ${errMsg.substring(0,120)}`);
+          res.writeHead(400);
+          return res.end(JSON.stringify({ ok: false, error: errMsg.substring(0,200), to: fullNumber }));
+        }
         const realChatId = sentMsg?.to || fullNumber;
         silenciarNumero(fullNumber);
         if (realChatId !== fullNumber && realChatId !== to) {
@@ -691,6 +845,7 @@ const apiServer = http.createServer((req, res) => {
       
       if (req.url === "/global-off") {
         botGlobalOff = true;
+        guardarGlobalOff();
         console.log(`🛑 Bot global APAGADO vía API`);
         res.writeHead(200);
         return res.end(JSON.stringify({ ok: true, status: "off" }));
@@ -698,9 +853,21 @@ const apiServer = http.createServer((req, res) => {
       
       if (req.url === "/global-on") {
         botGlobalOff = false;
+        guardarGlobalOff();
         console.log(`🟢 Bot global ENCENDIDO vía API`);
         res.writeHead(200);
         return res.end(JSON.stringify({ ok: true, status: "on" }));
+      }
+      
+      if (req.url === "/status") {
+        res.writeHead(200);
+        return res.end(JSON.stringify({
+          ok: true,
+          status: botGlobalOff ? "off" : "on",
+          connected: client ? true : false,
+          silenced: silencedMap.size,
+          uptime: process.uptime()
+        }));
       }
       
       res.writeHead(404);
@@ -712,10 +879,18 @@ const apiServer = http.createServer((req, res) => {
   });
 });
 
+apiServer.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.log(`⚠️ Puerto ${API_PORT} ya en uso — API HTTP no disponible (probablemente restauración de proceso)`);
+  } else {
+    console.error(`❌ Error API server:`, err.message);
+  }
+});
+
 apiServer.listen(API_PORT, () => {
   console.log(`📨 API de envío en http://localhost:${API_PORT}/send`);
 });
 
 // ─── INICIAR ─────────────────────────────────────────
-console.log("🚀 Iniciando Bot HTK v2...");
+console.log("🚀 Iniciando Bot HTK v4...");
 client.initialize();
