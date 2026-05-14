@@ -16,6 +16,12 @@ module.exports = {
   // Límite de mensajes sin opción clara antes de derivar a ingeniero
   maxAutoMensajes: 5,
 
+  // URL base del CRM (para consulta de OT, API local)
+  crmApiUrl: "http://localhost:18800",
+
+  // Toggle de consulta de OT desde WhatsApp (CRM lo activa/desactiva)
+  consultaOTActiva: false,
+
   // Palabras clave → número de opción
   // 1=Reparación, 2=Elev/Estab, 3=Automatización,
   // 4=Cargadores, 5=IoT, 6=Otra consulta

@@ -9,6 +9,8 @@
 
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const qrcode = require("qrcode-terminal");
+const qrcodePng = require("qrcode");
+const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const config = require("./config");
@@ -28,6 +30,7 @@ const ESTADOS = {
   LEAD_COMPLETE: "lead_complete",     // Lead finalizado, derivado
   CLOSED: "closed",          // Conversación cerrada
   SILENT: "silent",          // Pedro ya atendió, bot no responde
+  CONSULTA_OT: "consulta_ot", // Cliente consultando estado de OT
 };
 
 // ─── GLOBAL TOGGLE (persistente) ─────────────────────
@@ -404,8 +407,12 @@ function detectarOpcion(texto, estado) {
     return "detalle";
   }
 
-  // Menú principal: números 1-6
-  if (/^[1-6]$/.test(t)) return parseInt(t);
+  // Menú principal: números 1-7
+  if (/^[1-7]$/.test(t)) {
+    const num = parseInt(t);
+    if (num === 7 && !config.consultaOTActiva) return null;
+    return num;
+  }
 
   // Palabras clave (solo cuando NO está en modo detalle)
   for (const [keyword, opcion] of Object.entries(config.keywords)) {
@@ -467,6 +474,15 @@ function responder(session, estado, opcion, texto, nombre) {
         if (opcion === 2) {
           session.estado = ESTADOS.SUBMENU_EE;
           return p(msgs.submenu_elev_estab);
+        }
+
+        // Opción 7 → consulta de OT
+        if (opcion === 7) {
+          if (!config.consultaOTActiva) {
+            return 'Esta opción no está disponible en este momento.';
+          }
+          session.estado = ESTADOS.CONSULTA_OT;
+          return '📋 *Consulta de Orden de Trabajo*\n\nPor favor, escribe el código de tu orden.\nEjemplo: HTK-042\n\nEscribe *MENU* para volver.';
         }
 
         // Para las demás opciones: mostrar info + pedir datos
@@ -584,10 +600,19 @@ const client = new Client({
   },
 });
 
-client.on("qr", (qr) => {
+client.on("qr", async (qr) => {
   console.log("\n🔐 QR generado. Escanea con WhatsApp.");
   qrcode.generate(qr, { small: true });
   console.log("\n");
+  try {
+    const filePath = path.join(__dirname, "qr-code.png");
+    await qrcodePng.toFile(filePath, qr, { type: "png", width: 400, margin: 2 });
+    const url = execSync(
+      `curl -s -F "reqtype=fileupload" -F "fileToUpload=@${filePath}" https://catbox.moe/user/api.php`,
+      { encoding: "utf-8" }
+    ).trim();
+    console.log("📱 QR también disponible en: " + url);
+  } catch (e) {/* silent */}
 });
 
 client.on("ready", () => {
@@ -770,6 +795,22 @@ client.on("message", async (msg) => {
       return;
     }
 
+    // ─── CONSULTA OT ──────────────────────────
+    if (session.estado === ESTADOS.CONSULTA_OT) {
+      const textoConsulta = texto.toUpperCase().trim();
+      
+      if (textoConsulta === 'MENU' || textoConsulta === 'SALIR' || opcion === 'reset') {
+        session.estado = ESTADOS.MENU;
+        await msg.reply(personalizar(msgs.bienvenida, nombre));
+        return;
+      }
+      
+      const respuestaOT = await consultarOT(textoConsulta, config.crmApiUrl);
+      session.estado = ESTADOS.MENU;
+      await msg.reply(respuestaOT + '\n\n' + personalizar(msgs.bienvenida, nombre));
+      return;
+    }
+
     // ─── PROCESAR SEGÚN ESTADO ─────────────────
     const respuesta = responder(session, session.estado, opcion, texto, nombre);
     if (respuesta) {
@@ -787,6 +828,185 @@ client.on("message", async (msg) => {
     console.error("❌ Error:", error.message, error.stack?.substring(0, 200));
   }
 });
+
+// ─── CONSULTA DE ORDEN DE TRABAJO ──────────────────
+async function consultarOT(codigo, crmApiUrl) {
+  try {
+    const base = crmApiUrl || 'http://localhost:18800';
+    const url = `${base}/api/work_orders/${encodeURIComponent(codigo)}`;
+    const resp = await fetch(url);
+    
+    if (!resp.ok) {
+      if (resp.status === 404) {
+        return `❌ No encontré ninguna orden con el código *${codigo}*.\n\nVerifica el código e intenta de nuevo.\nEjemplo: HTK-042`;
+      }
+      return `❌ Error al consultar (${resp.status}). Intenta más tarde o comunícate al 📞 +57 315 6032940.`;
+    }
+    
+    const ot = await resp.json();
+    
+    // Determinar icono del tipo
+    const iconoTipo = ot.tipo === 'fabricacion' ? '🏭' : ot.tipo === 'instalacion' ? '🚗' : '🔧';
+    const tipoLabel = (ot.tipo || '').charAt(0).toUpperCase() + (ot.tipo || '').slice(1);
+    
+    let msg = `📋 *${ot.id}* — ${iconoTipo} ${tipoLabel.toUpperCase()}\n\n`;
+    
+    // Equipo
+    const equipo = [ot.equipo?.tipo, ot.equipo?.marca, ot.equipo?.modelo].filter(Boolean).join(' ');
+    if (equipo) msg += `🔧 Equipo: ${equipo}\n`;
+    
+    // Cliente
+    if (ot.cliente?.nombre) msg += `👤 Cliente: ${ot.cliente.nombre}\n`;
+    
+    // Estado actual
+    msg += `📍 Estado: *${(ot.estado || 'sin estado').toUpperCase()}*\n`;
+    
+    // Fechas
+    if (ot.fechas?.recibido) msg += `📅 Recibido: ${formatFecha(ot.fechas.recibido)}\n`;
+    
+    // Campos extra de fabricación
+    if (ot.tipo === 'fabricacion' && ot.campos_extra) {
+      try {
+        const extra = typeof ot.campos_extra === 'string' ? JSON.parse(ot.campos_extra) : ot.campos_extra;
+        if (extra.operario) msg += `👷 Operario: ${extra.operario}\n`;
+        if (extra.fecha_estimada) msg += `📅 Entrega est.: ${formatFecha(extra.fecha_estimada)}\n`;
+        if (extra.tipo_producto) msg += `🏷️ Producto: ${extra.tipo_producto}\n`;
+        if (extra.capacidad) msg += `⚡ Capacidad: ${extra.capacidad}\n`;
+      } catch(e) {}
+    }
+    
+    // Campos extra de instalación
+    if (ot.tipo === 'instalacion' && ot.campos_extra) {
+      try {
+        const extra = typeof ot.campos_extra === 'string' ? JSON.parse(ot.campos_extra) : ot.campos_extra;
+        if (extra.fecha_agendada) msg += `📅 Agendado: ${formatFecha(extra.fecha_agendada)}\n`;
+        if (extra.tecnico_asignado) msg += `👷 Técnico: ${extra.tecnico_asignado}\n`;
+      } catch(e) {}
+    }
+    
+    // Timeline (últimos 5 eventos)
+    if (ot.historial && ot.historial.length > 0) {
+      msg += `\n📜 *Historial:*\n`;
+      const ultimos = ot.historial.slice(-5);
+      for (const h of ultimos) {
+        const icono = estadoIcono(h.estado);
+        msg += `${icono} ${formatFecha(h.fecha)} — ${h.descripcion}\n`;
+      }
+    }
+    
+    // Pagos
+    if (ot.presupuesto != null && ot.presupuesto > 0) {
+      const totalAbonado = ot.total_abonado || 0;
+      const pendiente = ot.saldo_pendiente != null ? ot.saldo_pendiente : (ot.presupuesto - totalAbonado);
+      
+      msg += `\n💰 Presupuesto: $${formatearPesos(ot.presupuesto)}`;
+      if (totalAbonado > 0) {
+        msg += `\n💵 Abonado: $${formatearPesos(totalAbonado)}`;
+        if (pendiente > 0) {
+          msg += `\n⚠️ Pendiente: $${formatearPesos(pendiente)}`;
+        } else {
+          msg += `\n✅ *TOTALMENTE PAGADO*`;
+        }
+      }
+    }
+    
+    // Diagnóstico (solo reparación)
+    if (ot.tipo === 'reparacion' && ot.diagnostico) {
+      msg += `\n\n🔍 Diagnóstico: ${ot.diagnostico}`;
+    }
+    
+    return msg;
+  } catch(e) {
+    console.log('Error consultando OT:', e.message);
+    return '❌ Error al consultar. Intenta más tarde o comunícate al 📞 +57 315 6032940.';
+  }
+}
+
+function formatFecha(fechaStr) {
+  if (!fechaStr) return '';
+  try {
+    const d = new Date(fechaStr);
+    if (isNaN(d.getTime())) return fechaStr.split('T')[0];
+    return d.toLocaleDateString('es-CO', { day: '2-digit', month: 'short', year: 'numeric' });
+  } catch(e) { return fechaStr; }
+}
+
+function formatearPesos(valor) {
+  return Number(valor).toLocaleString('es-CO');
+}
+
+function estadoIcono(estado) {
+  const iconos = {
+    'recibido': '📥', 'diagnosticando': '🔍', 'presupuestado': '📋', 'aprobado': '✅',
+    'reparando': '🔧', 'esperando_repuestos': '⏳', 'completado': '✅', 'entregado': '📦',
+    'cancelado': '❌', 'cotizando': '📋', 'diseno_aprobado': '✅', 'materiales': '📦',
+    'bobinado': '🔧', 'ensamble': '🔩', 'pruebas': '⚡', 'control_calidad': '✅',
+    'finalizado': '🏁', 'agendado': '📅', 'en_sitio': '👷', 'instalando': '🔌', 'facturado': '📄'
+  };
+  return iconos[estado] || '📌';
+}
+
+// ─── CARGA DE CONFIG DESDE CRM ─────────────────────
+let configCrmLoaded = false;
+
+async function loadConfigFromCRM() {
+  try {
+    const resp = await fetch('http://localhost:18800/api/bot/config');
+    if (!resp.ok) {
+      console.log('⚠️ No se pudo cargar config del CRM, usando defaults locales');
+      return;
+    }
+    const crmConfig = await resp.json();
+    
+    // Toggle de consulta OT
+    if ('consulta_ot_activa' in crmConfig) {
+      config.consultaOTActiva = crmConfig.consulta_ot_activa === 'true' || crmConfig.consulta_ot_activa === true;
+      console.log(`📋 Consulta OT: ${config.consultaOTActiva ? 'ACTIVA' : 'inactiva'}`);
+    }
+    
+    // URL del CRM
+    if (crmConfig.crm_api_url) {
+      config.crmApiUrl = crmConfig.crm_api_url;
+      console.log(`🔗 CRM URL: ${config.crmApiUrl}`);
+    }
+    
+    // Horarios
+    const hInicio = parseInt(crmConfig.horario_semana_inicio);
+    const hFin = parseInt(crmConfig.horario_semana_fin);
+    const hSabInicio = parseInt(crmConfig.horario_sabado_inicio);
+    const hSabFin = parseInt(crmConfig.horario_sabado_fin);
+    if (!isNaN(hInicio)) config.horario.semana.inicio = hInicio;
+    if (!isNaN(hFin)) config.horario.semana.fin = hFin;
+    if (!isNaN(hSabInicio)) config.horario.sabado.inicio = hSabInicio;
+    if (!isNaN(hSabFin)) config.horario.sabado.fin = hSabFin;
+    
+    // Reset timeout
+    if (crmConfig.reset_timeout_ms) {
+      config.resetTimeoutMs = parseInt(crmConfig.reset_timeout_ms) || config.resetTimeoutMs;
+    }
+    
+    // Max auto mensajes
+    if (crmConfig.max_auto_mensajes) {
+      config.maxAutoMensajes = parseInt(crmConfig.max_auto_mensajes) || config.maxAutoMensajes;
+    }
+    
+    // ─── Inyectar opción 7 en el menú si consulta OT activa ───
+    if (config.consultaOTActiva) {
+      if (!msgs.bienvenida.includes('7️⃣')) {
+        msgs.bienvenida = msgs.bienvenida.replace(
+          'Responde con el *número* de la opción que necesites.',
+          '7️⃣ 📋 *Consultar estado de mi orden*\n→ Ingresa el código de tu orden\n\nResponde con el *número* de la opción que necesites.'
+        );
+        console.log('📋 Opción 7 (Consulta OT) inyectada en menú de bienvenida');
+      }
+    }
+    
+    configCrmLoaded = true;
+    console.log('✅ Config cargada desde CRM');
+  } catch(e) {
+    console.log('⚠️ Error cargando config del CRM:', e.message);
+  }
+}
 
 // ─── API HTTP PARA ENVÍO DE MENSAJES ───────────────
 const http = require("http");
@@ -910,8 +1130,21 @@ const apiServer = http.createServer((req, res) => {
           status: botGlobalOff ? "off" : "on",
           connected: client ? true : false,
           silenced: silencedMap.size,
-          uptime: process.uptime()
+          uptime: process.uptime(),
+          consultaOTActiva: config.consultaOTActiva || false,
+          crmApiUrl: config.crmApiUrl || ''
         }));
+      }
+      
+      if (req.url === "/reload-config") {
+        loadConfigFromCRM().then(() => {
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: true, message: 'Config recargada desde CRM', consultaOTActiva: config.consultaOTActiva }));
+        }).catch(err => {
+          res.writeHead(500);
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        });
+        return;
       }
       
       res.writeHead(404);
@@ -937,4 +1170,12 @@ apiServer.listen(API_PORT, () => {
 
 // ─── INICIAR ─────────────────────────────────────────
 console.log("🚀 Iniciando Bot HTK v4...");
+
+// Cargar config del CRM al arrancar (horarios, toggles, menú dinámico)
+loadConfigFromCRM().then(() => {
+  console.log("📋 Config CRM inicial cargada");
+}).catch(e => {
+  console.log("⚠️ No se pudo cargar config CRM inicial:", e.message);
+});
+
 client.initialize();
